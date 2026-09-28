@@ -1,0 +1,486 @@
+%% SDPPG Arterial Stiffness Monitor - STANDALONE (ROBUST)
+% Reads the SAME Arduino serial stream as your main monitor.
+% Computes ONLY Stiffness Index (SI) and Reflection Index (RI)
+% from the 2nd derivative of the IR PPG waveform (SDPPG).
+%
+% Arduino output format (unchanged):
+%   redAC,irAC,redDC,irDC,finger
+%
+% Requires: Signal Processing Toolbox (butter, filtfilt, findpeaks)
+%
+% Author: Group 3 - EEE-4238
+
+clear; clc; close all;
+
+%% ---------- CONFIG ----------
+SERIAL_PORT = "COM7";        % <<< SAME as your main monitor
+BAUD_RATE   = 115200;
+
+% FS must match your Arduino SEND_INTERVAL:
+%   SEND_INTERVAL = 20 -> FS = 50
+%   SEND_INTERVAL = 10 -> FS = 100  (recommended for SDPPG)
+FS          = 50;
+
+WINDOW_SEC  = 15;            % longer window = more beats = more stable
+BUF_LEN     = FS * WINDOW_SEC;
+
+ANALYSIS_PERIOD = 1.0;       % seconds between SI/RI recomputation
+
+% --- SDPPG tuning ---
+SMOOTH_SEC   = 0.10;         % pre-diff moving average
+SG_ORDER     = 2;            % Savitzky-Golay polynomial order
+SG_FRAME_SEC = 0.10;         % SG frame length in seconds
+
+% --- Physiological validity windows ---
+BD_MIN_MS   = 120;           % b->d lower bound (ms)
+BD_MAX_MS   = 420;           % b->d upper bound (ms)
+RI_MIN_PCT  = 10;            % relaxed — stiff arteries / cold hands
+RI_MAX_PCT  = 95;
+SI_MIN      = 1.0;           % SI sanity range
+SI_MAX      = 30.0;
+
+% --- SI scale (set to heart-to-finger distance in meters for m/s) ---
+ARM_LENGTH_M = 1.0;
+
+% Finger detection thresholds (match Arduino)
+FINGER_MIN_IR_DC = 5000;
+FINGER_MAX_IR_DC = 250000;
+
+% --- Diagnostics ---
+VERBOSE = true;              % print reason for WEAK/REJECT frames
+
+%% ---------- SERIAL SETUP ----------
+if ~isempty(serialportfind)
+    delete(serialportfind);
+end
+
+try
+    s = serialport(SERIAL_PORT, BAUD_RATE);
+    configureTerminator(s, "LF");
+    flush(s);
+    disp("Connected to " + SERIAL_PORT);
+catch ME
+    error("Cannot open %s. Error: %s", SERIAL_PORT, ME.message);
+end
+
+%% ---------- WAIT FOR READY ----------
+disp("Waiting for Arduino...");
+t0 = tic;
+ready = false;
+while toc(t0) < 15
+    try
+        line = readline(s);
+        txt = strtrim(char(line));
+        if isempty(txt), continue; end
+        disp("Arduino: " + txt);
+        if contains(txt, "READY") || contains(txt, "ERROR")
+            ready = true;
+            break;
+        end
+    catch
+    end
+end
+if ~ready
+    warning("No READY received. Continuing anyway...");
+end
+
+%% ---------- BUFFERS ----------
+redBuf   = zeros(BUF_LEN, 1);
+irBuf    = zeros(BUF_LEN, 1);
+redDCbuf = zeros(BUF_LEN, 1);
+irDCbuf  = zeros(BUF_LEN, 1);
+idx      = 1;
+nSamples = 0;
+bufferReady = false;
+
+%% ---------- FILTER (widened to 0.5-10 Hz to keep dicrotic notch) ----------
+[bFilt, aFilt] = butter(3, [0.5 10]/(FS/2), 'bandpass');
+
+% Savitzky-Golay frame length (odd, >= SG_ORDER+2)
+sgFrame = round(SG_FRAME_SEC * FS);
+if mod(sgFrame,2) == 0, sgFrame = sgFrame + 1; end
+if sgFrame < SG_ORDER + 2, sgFrame = SG_ORDER + 3; end
+
+%% ---------- FIGURE ----------
+fig = figure('Name','SDPPG Arterial Stiffness Monitor (Robust)', ...
+             'NumberTitle','off', ...
+             'Position',[100 80 1100 850], ...
+             'CloseRequestFcn', @(src,~) closeApp(src,s));
+
+% --- Plot 1: Filtered IR PPG (with notch preserved) ---
+ax1 = subplot(3,1,1);
+hPPG = animatedline(ax1,'Color',[0.2 0.3 0.85],'LineWidth',1.2);
+grid(ax1,'on');
+title(ax1,'Filtered IR PPG (0.5–10 Hz) — look for dicrotic notch on downslope');
+ylabel(ax1,'Amplitude');
+
+% --- Plot 2: SDPPG with b and d markers ---
+ax2 = subplot(3,1,2);
+hSDP = animatedline(ax2,'Color',[0.6 0.2 0.7],'LineWidth',1.2);
+hold(ax2,'on');
+hB   = plot(ax2, NaN, NaN, 'g^', 'MarkerFaceColor','g', 'MarkerSize',11);
+hD   = plot(ax2, NaN, NaN, 'rv', 'MarkerFaceColor','r', 'MarkerSize',11);
+hold(ax2,'off');
+grid(ax2,'on');
+legend(ax2, {'SDPPG (normalized)','b (systolic)','d (notch)'}, ...
+       'Location','best');
+title(ax2,'SDPPG — normalized -d²/dt²');
+ylabel(ax2,'-d²/dt² / RMS');
+
+% --- Plot 3: SI and RI trends ---
+ax3 = subplot(3,1,3);
+yyaxis(ax3,'left');
+hSI = animatedline(ax3,'Color',[0.85 0.2 0.2],'LineWidth',1.5);
+ylabel(ax3,'Stiffness Index (m/s)');
+ylim(ax3, [0 30]);
+yyaxis(ax3,'right');
+hRI = animatedline(ax3,'Color',[0.1 0.6 0.4],'LineWidth',1.5);
+ylabel(ax3,'Reflection Index (%)');
+ylim(ax3, [0 100]);
+grid(ax3,'on');
+title(ax3,'Arterial Stiffness Trend (only valid frames)');
+xlabel(ax3,'Time (s)');
+legend(ax3, {'SI','RI'}, 'Location','best');
+
+% --- Metrics box ---
+metricsBox = uicontrol('Style','text','Units','normalized', ...
+    'Position',[0.02 0.005 0.96 0.055], ...
+    'String','SI: -- | RI: -- % | b–d: -- ms | Finger: --', ...
+    'FontSize',13,'FontWeight','bold', ...
+    'ForegroundColor',[0 0 0], ...
+    'BackgroundColor',[0.92 0.92 0.92]);
+
+%% ---------- MAIN LOOP ----------
+siHistory = [];
+riHistory = [];
+tHistory  = [];
+lastAnalysis = tic;
+
+disp("Streaming SDPPG data... Close the figure to stop.");
+
+try
+    while ishandle(fig)
+        % ---- Read one line ----
+        try
+            rawLine = readline(s);
+        catch
+            pause(0.01); continue;
+        end
+
+        line = strtrim(char(rawLine));
+        if isempty(line), continue; end
+
+        % Skip non-numeric lines
+        if ~isstrprop(line(1), 'digit') && line(1) ~= '-'
+            disp("Arduino: " + string(line));
+            continue;
+        end
+
+        % ---- Parse ----
+        vals = sscanf(line, "%d,%d,%d,%d,%d");
+        if numel(vals) < 5, continue; end
+
+        redAC  = vals(1);
+        irAC   = vals(2);
+        redDC  = vals(3);
+        irDC   = vals(4);
+        finger = vals(5);
+
+        % ---- Finger-off handling ----
+        if finger == 0 || irDC < FINGER_MIN_IR_DC || irDC > FINGER_MAX_IR_DC
+            set(metricsBox,'String', ...
+                'SI: -- | RI: -- % | b–d: -- ms | Finger: NO', ...
+                'ForegroundColor',[0 0 0], ...
+                'BackgroundColor',[1 0.95 0.75]);
+            drawnow limitrate;
+            continue;
+        end
+
+        nSamples = nSamples + 1;
+
+        redBuf(idx)   = redAC;
+        irBuf(idx)    = irAC;
+        redDCbuf(idx) = redDC;
+        irDCbuf(idx)  = irDC;
+        idx = idx + 1;
+        if idx > BUF_LEN
+            idx = 1;
+            bufferReady = true;
+        end
+
+        % ---- Periodic analysis ----
+        if bufferReady && toc(lastAnalysis) >= ANALYSIS_PERIOD
+            lastAnalysis = tic;
+
+            [irOrd, ~, ~, ~] = getOrdered(irBuf, redBuf, irDCbuf, redDCbuf, idx);
+
+            irFilt = filtfilt(bFilt, aFilt, double(irOrd));
+
+            clearpoints(hPPG);
+            addpoints(hPPG, (1:numel(irFilt))/FS, irFilt);
+
+            % ---- SDPPG -> SI / RI ----
+            [si, ri, dt_bd_ms, sdp, bIdx, dIdx, sysIdx, quality, reason] = ...
+                computeSDPPG_SI_RI(irFilt, FS, SMOOTH_SEC, ...
+                                   SG_ORDER, sgFrame, ARM_LENGTH_M, ...
+                                   BD_MIN_MS, BD_MAX_MS, ...
+                                   RI_MIN_PCT, RI_MAX_PCT, ...
+                                   SI_MIN, SI_MAX);
+
+            % ---- SDPPG plot ----
+            clearpoints(hSDP);
+            addpoints(hSDP, (1:numel(sdp))/FS, sdp);
+
+            if ~isnan(bIdx) && bIdx >= 1 && bIdx <= numel(sdp)
+                set(hB, 'XData', bIdx/FS, 'YData', sdp(bIdx));
+            else
+                set(hB, 'XData', NaN, 'YData', NaN);
+            end
+
+            % d is on the PPG, not SDPPG — mark it at the same time but on
+            % the SDPPG curve (value there is sdp(dIdx))
+            if ~isnan(dIdx) && dIdx >= 1 && dIdx <= numel(sdp)
+                set(hD, 'XData', dIdx/FS, 'YData', sdp(dIdx));
+            else
+                set(hD, 'XData', NaN, 'YData', NaN);
+            end
+
+            % ---- Trend plot: only plot ACCEPTED frames ----
+            tNow = nSamples / FS;
+            if strcmp(quality, 'ok') && ~isnan(si) && ~isnan(ri)
+                siHistory(end+1) = si;
+                riHistory(end+1) = ri;
+                tHistory(end+1)  = tNow;
+                addpoints(hSI, tNow, si);
+                addpoints(hRI, tNow, ri);
+            end
+
+            % ---- Metrics text ----
+            siStr = fmtNum(si,       "%.2f", "--");
+            riStr = fmtNum(ri,       "%.1f", "--");
+            dtStr = fmtNum(dt_bd_ms, "%.0f", "--");
+
+            switch quality
+                case 'ok',   bgColor = [0.80 0.95 0.80];  % green
+                case 'weak', bgColor = [1.00 0.95 0.75];  % yellow
+                otherwise,   bgColor = [1.00 0.85 0.85];  % red
+            end
+
+            set(metricsBox,'String', ...
+                sprintf("SI: %s m/s | RI: %s %% | b–d: %s ms | Finger: YES [%s]", ...
+                siStr, riStr, dtStr, upper(quality)), ...
+                'ForegroundColor',[0 0 0], ...
+                'BackgroundColor', bgColor);
+
+            if VERBOSE && ~strcmp(quality, 'ok')
+                fprintf('[%6.1fs] %-6s | SI=%7s RI=%7s b-d=%6s | %s\n', ...
+                    tNow, upper(quality), siStr, riStr, dtStr, reason);
+            end
+
+            drawnow limitrate;
+        end
+    end
+catch ME
+    disp("Loop ended: " + ME.message);
+end
+
+%% ---------- SAVE ----------
+if ~isempty(siHistory)
+    if ~isfolder('data'), mkdir('data'); end
+    T = table(tHistory', siHistory', riHistory', ...
+              'VariableNames', {'Time_sec','SI','RI_percent'});
+    fname = fullfile('data', sprintf('stiffness_%s.csv', ...
+        datestr(now,'yyyymmdd_HHMMSS')));
+    writetable(T, fname);
+    disp("Saved: " + fname);
+end
+
+clear s;
+disp("Done.");
+
+%% ================= HELPERS =================
+
+function closeApp(src, s)
+    try, clear s; catch, end
+    delete(src);
+end
+
+function [irOrd, redOrd, irDCOrd, redDCOrd] = getOrdered( ...
+        irBuf, redBuf, irDCbuf, redDCbuf, idx)
+    if idx == 1
+        irOrd = irBuf; redOrd = redBuf;
+        irDCOrd = irDCbuf; redDCOrd = redDCbuf;
+    else
+        irOrd    = [irBuf(idx:end);    irBuf(1:idx-1)];
+        redOrd   = [redBuf(idx:end);   redBuf(1:idx-1)];
+        irDCOrd  = [irDCbuf(idx:end);  irDCbuf(1:idx-1)];
+        redDCOrd = [redDCbuf(idx:end); redDCbuf(1:idx-1)];
+    end
+end
+
+% ============================================================
+%  ROBUST SDPPG -> SI & RI
+% ============================================================
+function [si, ri, dt_bd_ms, sdp, bIdx, dIdx, sysIdx, quality, reason] = ...
+        computeSDPPG_SI_RI(irFilt, fs, smoothSec, sgOrder, sgFrame, ...
+                           armLen, bdMinMs, bdMaxMs, riMin, riMax, ...
+                           siMin, siMax)
+% Returns:
+%   si, ri      : metrics (NaN if not computable)
+%   dt_bd_ms    : b -> d interval (ms)
+%   sdp         : normalized -d²/dt²
+%   bIdx        : index of b on SDPPG
+%   dIdx        : index of d on PPG (mapped to same time base)
+%   sysIdx      : index of the PPG systolic peak (for reference)
+%   quality     : 'ok' | 'weak' | 'reject'
+%   reason      : human-readable explanation when not 'ok'
+
+    si = NaN; ri = NaN; dt_bd_ms = NaN; bIdx = NaN; dIdx = NaN;
+    sysIdx = NaN;
+    sdp = zeros(size(irFilt));
+    quality = 'reject';
+    reason = '';
+
+    N = numel(irFilt);
+    if N < round(2.0 * fs)
+        reason = 'window too short';
+        return;
+    end
+    irFilt = double(irFilt(:));
+
+    % ---- 1. Pre-smooth ----
+    win = max(3, round(smoothSec * fs));
+    if mod(win,2) == 0, win = win + 1; end
+    if win >= N, win = 3; end
+    irSmooth = movmean(irFilt, win);
+
+    % ---- 2. Savitzky-Golay ----
+    if exist('sgolayfilt','file') == 2
+        irSG = sgolayfilt(irSmooth, sgOrder, sgFrame);
+    else
+        irSG = irSmooth;
+    end
+
+    % ---- 3. 2nd derivative, normalized ----
+    d1 = gradient(irSG, 1/fs);
+    d2 = gradient(d1,   1/fs);
+
+    sdpRms = rms(d2);
+    if sdpRms <= 0 || ~isfinite(sdpRms)
+        reason = 'SDPPG RMS=0';
+        return;
+    end
+    sdpN = -d2 / sdpRms;
+    sdp  = sdpN;
+
+    % ---- 4. Find b on SDPPG (relaxed threshold = 1.0) ----
+    minDistB = round(0.40 * fs);
+    minHB    = 1.0;
+    [~, bLocs] = findpeaks(sdpN, ...
+        'MinPeakDistance', minDistB, ...
+        'MinPeakHeight',   minHB);
+
+    if numel(bLocs) < 2
+        reason = sprintf('only %d b-peak(s) found (need >=2)', numel(bLocs));
+        return;
+    end
+
+    bIdx = bLocs(end-1);
+    bAmp = sdpN(bIdx);
+    if bAmp <= 0
+        reason = 'b amplitude <= 0';
+        return;
+    end
+
+    % ---- 5. Find systolic peak on PPG AFTER b ----
+    % b is on the upstroke; the systolic peak is a bit later.
+    % Search up to 400 ms after b for the PPG maximum.
+    sysSearchEnd = min(N, bIdx + round(0.40 * fs));
+    if sysSearchEnd <= bIdx + 2
+        reason = 'no room for systolic search';
+        return;
+    end
+    [sysPk, sysRel] = max(irFilt(bIdx:sysSearchEnd));
+    sysIdx = bIdx + sysRel - 1;
+    if sysPk <= 0
+        reason = 'systolic peak <= 0';
+        return;
+    end
+
+    % ---- 6. Find d on PPG AFTER the systolic peak (dicrotic notch) ----
+    % Notch lives 80-350 ms after systolic peak.
+    wStart = sysIdx + round(0.05 * fs);           % 50 ms after systolic
+    wEnd   = min(N, sysIdx + round(0.40 * fs));   % up to 400 ms after
+    if wEnd <= wStart + 2
+        reason = 'notch window too short';
+        return;
+    end
+
+    seg  = irFilt(wStart:wEnd);
+    prom = 0.03 * std(irFilt);   % lower prominence = more tolerant
+    [~, dRel] = findpeaks(-seg, 'MinPeakProminence', prom);
+
+    if isempty(dRel)
+        % No clear notch — take the global min in the window (best guess)
+        [~, dRel] = min(seg);
+        dRel = dRel(1);
+        notchFound = false;
+    else
+        dRel = dRel(1);
+        notchFound = true;
+    end
+    dIdx = wStart + dRel - 1;
+
+    % ---- 7. b-d interval ----
+    dt_bd    = (dIdx - bIdx) / fs;
+    dt_bd_ms = dt_bd * 1000;
+
+    if dt_bd_ms < bdMinMs || dt_bd_ms > bdMaxMs
+        quality = 'weak';
+        reason = sprintf('b-d out of range (%.0f ms; need %d-%d)', ...
+                         dt_bd_ms, bdMinMs, bdMaxMs);
+        return;
+    end
+
+    % ---- 8. RI from notch depth ----
+    dPkAmp = irFilt(dIdx);
+    riRaw  = 100 * abs(dPkAmp) / abs(sysPk);
+
+    % ---- 9. SI ----
+    siRaw = (bAmp * armLen) / dt_bd;
+
+    % ---- 10. Quality gates ----
+    if riRaw < riMin || riRaw > riMax
+        quality = 'weak';
+        if ~notchFound
+            reason = sprintf('RI=%.1f%% (no notch found; PPG too smooth)', riRaw);
+        else
+            reason = sprintf('RI=%.1f%% out of [%d,%d]', riRaw, riMin, riMax);
+        end
+        % Still report SI if it's valid; RI stays NaN
+        if siRaw >= siMin && siRaw <= siMax
+            si = siRaw;
+        end
+        return;
+    end
+
+    if siRaw < siMin || siRaw > siMax
+        quality = 'weak';
+        reason = sprintf('SI=%.2f out of [%.1f,%.1f]', siRaw, siMin, siMax);
+        ri = riRaw;
+        return;
+    end
+
+    si = siRaw;
+    ri = riRaw;
+    quality = 'ok';
+    reason = 'OK';
+end
+
+function out = fmtNum(val, fmt, fallback)
+    if isnan(val)
+        out = fallback;
+    else
+        out = sprintf(fmt, val);
+    end
+end
