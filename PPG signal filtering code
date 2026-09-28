@@ -1,0 +1,275 @@
+%% MAX30102 Health Monitor - MATLAB
+clear; clc; close all;
+
+%% ---------- CONFIG ----------
+SERIAL_PORT = "COM7";       % <<< CHANGE THIS if needed
+BAUD_RATE   = 115200;
+FS          = 50;           % effective sample rate (Hz)
+WINDOW_SEC  = 10;
+BUF_LEN     = FS * WINDOW_SEC;
+
+%% ---------- SERIAL SETUP ----------
+if ~isempty(serialportfind)
+    delete(serialportfind);
+end
+
+try
+    s = serialport(SERIAL_PORT, BAUD_RATE);
+    configureTerminator(s, "LF");
+    flush(s);
+    disp("Connected to " + SERIAL_PORT);
+catch ME
+    error("Cannot open %s. Error: %s", SERIAL_PORT, ME.message);
+end
+
+%% ---------- WAIT FOR READY ----------
+disp("Waiting for Arduino...");
+t0 = tic;
+ready = false;
+while toc(t0) < 15
+    try
+        line = readline(s);
+        txt = strtrim(char(line));
+        if isempty(txt), continue; end
+        disp("Arduino: " + txt);
+        if contains(txt, "READY") || contains(txt, "ERROR")
+            ready = true;
+            break;
+        end
+    catch
+    end
+end
+if ~ready
+    warning("No READY received. Continuing anyway...");
+end
+
+%% ---------- BUFFERS ----------
+redBuf   = zeros(BUF_LEN, 1);
+irBuf    = zeros(BUF_LEN, 1);
+redDCbuf = zeros(BUF_LEN, 1);
+irDCbuf  = zeros(BUF_LEN, 1);
+idx      = 1;
+nSamples = 0;
+
+%% ---------- FIGURE ----------
+fig = figure('Name','MAX30102 Monitor','NumberTitle','off', ...
+             'Position',[100 100 1100 750], ...
+             'CloseRequestFcn', @(src,~) closeApp(src,s));
+
+ax1 = subplot(3,1,1);
+hRed = animatedline(ax1,'Color',[0.85 0.2 0.2],'LineWidth',1);
+hIR  = animatedline(ax1,'Color',[0.2 0.3 0.85],'LineWidth',1);
+legend(ax1, {'Red','IR'}, 'Location','best'); grid(ax1,'on');
+title(ax1,'AC-Coupled PPG (Red vs IR)');
+ylabel(ax1,'Amplitude');
+
+ax2 = subplot(3,1,2);
+hFilt = animatedline(ax2,'Color',[0.1 0.6 0.4],'LineWidth',1.3);
+grid(ax2,'on');
+title(ax2,'Filtered IR PPG (0.5-5 Hz)');
+ylabel(ax2,'Amplitude');
+
+ax3 = subplot(3,1,3);
+hHR = animatedline(ax3,'Color',[0.9 0.5 0.1],'LineWidth',1.5);
+grid(ax3,'on'); ylim(ax3,[40 180]);
+title(ax3,'Heart Rate Trend');
+xlabel(ax3,'Time (s)'); ylabel(ax3,'BPM');
+
+% ---------- METRICS TEXT BOX (FIXED COLOR) ----------
+metricsBox = uicontrol('Style','text','Units','normalized', ...
+    'Position',[0.02 0.01 0.96 0.05], ...
+    'String','HR: -- BPM | SpO2: -- % | PI: -- % | Finger: --', ...
+    'FontSize',13,'FontWeight','bold', ...
+    'ForegroundColor',[0 0 0], ...               % BLACK text (fix)
+    'BackgroundColor',[0.92 0.92 0.92]);
+
+%% ---------- FILTER ----------
+[bFilt, aFilt] = butter(3, [0.5 5]/(FS/2), 'bandpass');
+
+%% ---------- MAIN LOOP ----------
+hrHistory = [];
+tHistory  = [];
+lastAnalysis = tic;
+
+disp("Streaming... Close the figure to stop.");
+
+try
+    while ishandle(fig)
+        % ---- read one line ----
+        try
+            rawLine = readline(s);
+        catch
+            pause(0.01); continue;
+        end
+
+        line = strtrim(char(rawLine));
+        if isempty(line), continue; end
+
+        % Skip non-numeric lines (auto-config prints)
+        if ~isstrprop(line(1), 'digit') && line(1) ~= '-'
+            disp("Arduino: " + string(line));
+            continue;
+        end
+
+        % ---- parse: redAC,irAC,redDC,irDC,finger ----
+        vals = sscanf(line, "%d,%d,%d,%d,%d");
+        if numel(vals) < 5, continue; end
+
+        redAC  = vals(1);
+        irAC   = vals(2);
+        redDC  = vals(3);
+        irDC   = vals(4);
+        finger = vals(5);
+
+        % ---- skip if no finger ----
+        if finger == 0 || irDC < 5000 || irDC > 250000
+            set(metricsBox,'String', ...
+                'HR: -- BPM | SpO2: -- % | PI: -- % | Finger: NO', ...
+                'ForegroundColor',[0 0 0], ...
+                'BackgroundColor',[1 0.95 0.75]);
+            drawnow limitrate;
+            continue;
+        end
+
+        nSamples = nSamples + 1;
+
+        % ---- push to circular buffers ----
+        redBuf(idx)   = redAC;
+        irBuf(idx)    = irAC;
+        redDCbuf(idx) = redDC;
+        irDCbuf(idx)  = irDC;
+        idx = idx + 1;
+        if idx > BUF_LEN, idx = 1; end
+
+        % ---- live raw plot ----
+        addpoints(hRed, nSamples/FS, redAC);
+        addpoints(hIR,  nSamples/FS, irAC);
+
+        % ---- periodic analysis (1 Hz) ----
+        if toc(lastAnalysis) >= 1.0
+            lastAnalysis = tic;
+
+            [irOrd, redOrd, irDCOrd, redDCOrd] = getOrdered( ...
+                irBuf, redBuf, irDCbuf, redDCbuf, idx);
+
+            irFilt = filtfilt(bFilt, aFilt, double(irOrd));
+
+            clearpoints(hFilt);
+            addpoints(hFilt, (1:numel(irFilt))/FS, irFilt);
+
+            % Compute metrics
+            hr   = computeHR(irFilt, FS);
+            spo2 = computeSpO2(redOrd, irOrd, redDCOrd, irDCOrd);
+            pi   = computePI(irOrd, irDCOrd);
+
+            if ~isnan(hr)
+                hrHistory(end+1) = hr;
+                tHistory(end+1)  = nSamples/FS;
+                addpoints(hHR, tHistory(end), hr);
+            end
+
+            hrStr  = fmtNum(hr,     "%.1f", "--");
+            spoStr = fmtNum(spo2,   "%.1f", "--");
+            piStr  = fmtNum(pi*100, "%.2f", "--");
+
+            set(metricsBox,'String', ...
+                sprintf("HR: %s BPM | SpO2: %s %% | PI: %s %% | Finger: YES", ...
+                hrStr, spoStr, piStr), ...
+                'ForegroundColor',[0 0 0]);
+
+            % Color feedback
+            if ~isnan(hr) && (hr > 110 || hr < 50)
+                set(metricsBox,'BackgroundColor',[1 0.80 0.80]);   % light red
+            elseif ~isnan(spo2) && spo2 < 94
+                set(metricsBox,'BackgroundColor',[1 0.80 0.80]);   % light red
+            else
+                set(metricsBox,'BackgroundColor',[0.80 0.95 0.80]); % light green
+            end
+
+            drawnow limitrate;
+        end
+    end
+catch ME
+    disp("Loop ended: " + ME.message);
+end
+
+%% ---------- SAVE ----------
+if ~isempty(hrHistory)
+    if ~isfolder('data'), mkdir('data'); end
+    T = table(tHistory', hrHistory', 'VariableNames', {'Time_sec','HR_BPM'});
+    fname = fullfile('data', sprintf('session_%s.csv', ...
+        datestr(now,'yyyymmdd_HHMMSS')));
+    writetable(T, fname);
+    disp("Saved: " + fname);
+end
+
+clear s;
+disp("Done.");
+
+%% ================= HELPERS =================
+
+function closeApp(src, s)
+    try, clear s; catch, end
+    delete(src);
+end
+
+function [irOrd, redOrd, irDCOrd, redDCOrd] = getOrdered( ...
+        irBuf, redBuf, irDCbuf, redDCbuf, idx)
+    n = numel(irBuf);
+    if idx == 1
+        irOrd = irBuf; redOrd = redBuf;
+        irDCOrd = irDCbuf; redDCOrd = redDCbuf;
+    else
+        irOrd    = [irBuf(idx:end);    irBuf(1:idx-1)];
+        redOrd   = [redBuf(idx:end);   redBuf(1:idx-1)];
+        irDCOrd  = [irDCbuf(idx:end);  irDCbuf(1:idx-1)];
+        redDCOrd = [redDCbuf(idx:end); redDCbuf(1:idx-1)];
+    end
+end
+
+function hr = computeHR(irFilt, fs)
+    hr = NaN;
+    minDist = round(fs * 0.4);
+    minH    = max(0.3 * max(irFilt), 3);
+    [~, locs] = findpeaks(irFilt, 'MinPeakDistance', minDist, ...
+                          'MinPeakHeight', minH);
+    if numel(locs) >= 2
+        ibi = diff(locs) / fs;
+        ibi = ibi(ibi > 0.3 & ibi < 1.5);
+        if ~isempty(ibi)
+            hr = 60 / mean(ibi);
+        end
+    end
+end
+
+function spo2 = computeSpO2(redAC, irAC, redDC, irDC)
+    spo2 = NaN;
+    if isempty(redAC) || isempty(irAC), return; end
+
+    acRed = rms(double(redAC));
+    acIr  = rms(double(irAC));
+    dcRed = mean(double(redDC));
+    dcIr  = mean(double(irDC));
+
+    if dcRed <= 0 || dcIr <= 0 || acIr <= 0, return; end
+
+    R = (acRed / dcRed) / (acIr / dcIr);
+    spo2 = 108 - 21 * R;
+    spo2 = max(70, min(100, spo2));
+end
+
+function pi = computePI(irAC, irDC)
+    pi = NaN;
+    dcMean = mean(double(irDC));
+    if dcMean > 0
+        pi = std(double(irAC)) / dcMean;
+    end
+end
+
+function out = fmtNum(val, fmt, fallback)
+    if isnan(val)
+        out = fallback;
+    else
+        out = sprintf(fmt, val);
+    end
+end
