@@ -1,0 +1,23 @@
+Troubleshooting
+
+****MATLAB codes used in this project were made fir MATLAB r2025a version if your version is older like 2016 ,18,19 this may not work you need to modify the code****
+
+****Change your code according to your COM port example COM1 COM2 COM3.......etc****
+
+problem 1: MATLAB and Arduino IDE cannot access data from the same port at the same time
+
+solution: First configure Arduino COM port 
+go to tools then select board : Arduino Uno( i am using Arduino uno)
+you will find select com port just after Board, select the one with your board(Arduino uno) then it my say COM1 or COM2 or COM7 etc.
+
+
+Then run Arduino code to enable data flow from sensor to serial monitor and observe if it works in serial monitor then check serial plotter for graphs. if it happens and Arduino successfully sends data to serial monitor then just close the Arduino.
+
+Open MATLAB and paste any of three codes and run if there is data coming in command window congrats it it is working and soon after live graph plots arrive.
+
+Problem 2 : Graph freeze
+Solution:
+To disconnect MATLAB from the com port type "clear s" in the command window. Then open Arduino again upload the code to Arduino again and keep doing until data flows again. After that close Arduino IDE again and run your code in MATLAB it should work. Do this repetitively if graph dosent show or freeze
+
+Problem 3: Flat graphs in Arduino serial plotter
+Solution: in Serial plotter uncheck some features of graph you may see it in upper left corner of the graph. 
