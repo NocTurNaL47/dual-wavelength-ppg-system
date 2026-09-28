@@ -1,0 +1,157 @@
+/*
+ * MAX30102 → Serial for MATLAB (Final Version)
+ * 
+ * Output format: redAC,irAC,redDC,irDC,finger
+ * Baud: 115200
+ * 
+ * Features:
+ *   - Auto-gain at startup
+ *   - Sample average = 1 (reduces saturation)
+ *   - ADC range = 2048 (narrower)
+ *   - No infinite loops
+ *   - AC-coupled output
+ */
+
+#include <Wire.h>
+#include "MAX30105.h"
+
+MAX30105 particleSensor;
+
+const byte BUFFER_SIZE = 100;
+uint32_t irBuffer[BUFFER_SIZE];
+uint32_t redBuffer[BUFFER_SIZE];
+
+unsigned long lastSend = 0;
+const unsigned long SEND_INTERVAL = 20;   // 50 Hz serial output
+
+// Finger detection
+const uint32_t FINGER_MIN = 5000;
+const uint32_t FINGER_MAX = 250000;
+
+// Chosen LED brightness (auto-set)
+byte chosenBrightness = 0x1F;
+
+// ---------- Helpers ----------
+uint32_t readIR(uint32_t samples = 20) {
+  uint32_t sum = 0;
+  for (uint32_t j = 0; j < samples; j++) {
+    unsigned long t = millis();
+    while (!particleSensor.available()) {
+      particleSensor.check();
+      if (millis() - t > 50) break;
+    }
+    sum += particleSensor.getIR();
+    particleSensor.nextSample();
+    delay(20);
+  }
+  return sum / samples;
+}
+
+void autoConfigure() {
+  byte brightnesses[] = {0x1F, 0x3F, 0x7F, 0xFF};
+  byte count = 4;
+
+  Serial.println("Auto-configuring sensor...");
+
+  for (byte i = 0; i < count; i++) {
+    // sampleAverage = 1 (less saturation), pulseWidth = 411, ADC = 2048
+    particleSensor.setup(brightnesses[i], 1, 2, 100, 411, 2048);
+    delay(200);
+
+    uint32_t avg = readIR(20);
+    Serial.print("Brightness 0x");
+    Serial.print(brightnesses[i], HEX);
+    Serial.print(" -> IR avg = ");
+    Serial.println(avg);
+
+    if (avg > 50000 && avg < 200000) {
+      chosenBrightness = brightnesses[i];
+      Serial.print("Chosen brightness: 0x");
+      Serial.println(chosenBrightness, HEX);
+      return;
+    }
+  }
+
+  // Fallback: use lowest brightness
+  particleSensor.setup(chosenBrightness, 1, 2, 100, 411, 2048);
+  Serial.print("Fallback brightness: 0x");
+  Serial.println(chosenBrightness, HEX);
+}
+
+// ---------- Setup ----------
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  Wire.begin();
+  Wire.setClock(400000);
+
+  if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
+    Serial.println("ERROR: MAX30102 not found. Check wiring.");
+    while (1) { delay(1000); }
+  }
+
+  autoConfigure();
+
+  // Prime buffer
+  for (byte i = 0; i < BUFFER_SIZE; i++) {
+    unsigned long t = millis();
+    while (!particleSensor.available()) {
+      particleSensor.check();
+      if (millis() - t > 100) break;
+    }
+    redBuffer[i] = particleSensor.getRed();
+    irBuffer[i]  = particleSensor.getIR();
+    particleSensor.nextSample();
+    delay(10);
+  }
+
+  Serial.println("READY");
+}
+
+// ---------- Main Loop ----------
+void loop() {
+  // Read one sample (with timeout)
+  unsigned long t = millis();
+  while (!particleSensor.available()) {
+    particleSensor.check();
+    if (millis() - t > 50) break;
+  }
+
+  // Shift buffer
+  for (byte i = 0; i < BUFFER_SIZE - 1; i++) {
+    redBuffer[i] = redBuffer[i + 1];
+    irBuffer[i]  = irBuffer[i + 1];
+  }
+  redBuffer[BUFFER_SIZE - 1] = particleSensor.getRed();
+  irBuffer[BUFFER_SIZE - 1]  = particleSensor.getIR();
+  particleSensor.nextSample();
+
+  // Send at fixed rate
+  if (millis() - lastSend >= SEND_INTERVAL) {
+    lastSend = millis();
+
+    // DC averages
+    uint32_t redDC = 0, irDC = 0;
+    for (byte i = 0; i < BUFFER_SIZE; i++) {
+      redDC += redBuffer[i];
+      irDC  += irBuffer[i];
+    }
+    redDC /= BUFFER_SIZE;
+    irDC  /= BUFFER_SIZE;
+
+    // Finger detection
+    bool fingerOn = (irDC > FINGER_MIN && irDC < FINGER_MAX);
+
+    // AC-coupled latest sample
+    int32_t redAC = (int32_t)redBuffer[BUFFER_SIZE - 1] - (int32_t)redDC;
+    int32_t irAC  = (int32_t)irBuffer[BUFFER_SIZE - 1]  - (int32_t)irDC;
+
+    // Output
+    Serial.print(redAC);   Serial.print(",");
+    Serial.print(irAC);    Serial.print(",");
+    Serial.print(redDC);   Serial.print(",");
+    Serial.print(irDC);    Serial.print(",");
+    Serial.println(fingerOn ? 1 : 0);
+  }
+}
