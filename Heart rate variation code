@@ -1,0 +1,397 @@
+%% HRV Monitor - STANDALONE
+% Reads the SAME Arduino serial stream as your main monitor.
+% Computes HR + time-domain HRV metrics:
+%   SDNN  - standard deviation of NN intervals (ms)
+%   RMSSD - root mean square of successive NN differences (ms)
+%   pNN50 - percentage of |ΔNN| > 50 ms
+%
+% Arduino output format (unchanged):
+%   redAC,irAC,redDC,irDC,finger
+%
+% Author: Group 3 - EEE-4238
+
+clear; clc; close all;
+
+%% ---------- CONFIG ----------
+SERIAL_PORT = "COM7";        % <<< SAME as your main monitor
+BAUD_RATE   = 115200;
+FS          = 50;            % must match Arduino SEND_INTERVAL (20 -> 50)
+
+PPG_WINDOW_SEC = 6;          % window used for beat detection (sec)
+BUF_LEN        = FS * PPG_WINDOW_SEC;
+
+HRV_WINDOW_SEC = 60;         % rolling HRV window (sec) — 60 s minimum
+MAX_NN         = 300;        % hard cap on stored NN intervals (~5 min @ 60 BPM)
+
+% Finger detection (match Arduino)
+FINGER_MIN_IR_DC = 5000;
+FINGER_MAX_IR_DC = 250000;
+
+% --- NN validity gates ---
+NN_MIN_MS   = 300;           % 200 BPM
+NN_MAX_MS   = 1500;          % 40 BPM
+NN_JUMP_PCT = 30;            % reject beats that jump >30% from median
+
+% --- Physiology sanity for HR display ---
+HR_MIN = 40;
+HR_MAX = 180;
+
+%% ---------- SERIAL SETUP ----------
+if ~isempty(serialportfind)
+    delete(serialportfind);
+end
+
+try
+    s = serialport(SERIAL_PORT, BAUD_RATE);
+    configureTerminator(s, "LF");
+    flush(s);
+    disp("Connected to " + SERIAL_PORT);
+catch ME
+    error("Cannot open %s. Error: %s", SERIAL_PORT, ME.message);
+end
+
+%% ---------- WAIT FOR READY ----------
+disp("Waiting for Arduino...");
+t0 = tic;
+ready = false;
+while toc(t0) < 15
+    try
+        line = readline(s);
+        txt = strtrim(char(line));
+        if isempty(txt), continue; end
+        disp("Arduino: " + txt);
+        if contains(txt, "READY") || contains(txt, "ERROR")
+            ready = true;
+            break;
+        end
+    catch
+    end
+end
+if ~ready
+    warning("No READY received. Continuing anyway...");
+end
+
+%% ---------- BUFFERS ----------
+redBuf  = zeros(BUF_LEN, 1);
+irBuf   = zeros(BUF_LEN, 1);
+irDCbuf = zeros(BUF_LEN, 1);
+idx     = 1;
+nSamples = 0;
+bufferReady = false;
+
+% NN history (in seconds) and wall-clock timestamps for rolling window
+nnHistory = [];       % NN intervals in seconds
+nnTime    = [];       % time (s since start) at which each NN ended
+
+%% ---------- FILTER ----------
+[bFilt, aFilt] = butter(3, [0.5 8]/(FS/2), 'bandpass');
+
+%% ---------- FIGURE ----------
+fig = figure('Name','HRV Monitor (SDNN / RMSSD / pNN50)', ...
+             'NumberTitle','off', ...
+             'Position',[100 80 1100 780], ...
+             'CloseRequestFcn', @(src,~) closeApp(src,s));
+
+% --- Plot 1: Filtered IR PPG with detected R-peaks ---
+ax1 = subplot(3,1,1);
+hPPG = animatedline(ax1,'Color',[0.2 0.3 0.85],'LineWidth',1.2);
+hold(ax1,'on');
+hPks = plot(ax1, NaN, NaN, 'rv', 'MarkerFaceColor','r', 'MarkerSize',8);
+hold(ax1,'off');
+grid(ax1,'on');
+legend(ax1, {'Filtered IR PPG','Detected peaks'}, 'Location','best');
+title(ax1,'Filtered IR PPG — beat detection');
+ylabel(ax1,'Amplitude');
+
+% --- Plot 2: Tachogram (NN intervals over time) ---
+ax2 = subplot(3,1,2);
+hNN = animatedline(ax2,'Color',[0.1 0.6 0.4],'LineWidth',1.3);
+grid(ax2,'on');
+title(ax2,'Tachogram (NN intervals)');
+ylabel(ax2,'NN (ms)');
+ylim(ax2, [400 1400]);
+
+% --- Plot 3: HRV trend (SDNN and RMSSD, both in ms) ---
+ax3 = subplot(3,1,3);
+hSDNN  = animatedline(ax3,'Color',[0.85 0.2 0.2],'LineWidth',1.5);
+hRMSSD = animatedline(ax3,'Color',[0.2 0.4 0.85],'LineWidth',1.5);
+grid(ax3,'on');
+title(ax3,'HRV Trend (rolling 60-s window)');
+xlabel(ax3,'Time (s)');
+ylabel(ax3,'ms');
+legend(ax3, {'SDNN','RMSSD'}, 'Location','best');
+
+% --- Metrics box ---
+metricsBox = uicontrol('Style','text','Units','normalized', ...
+    'Position',[0.02 0.005 0.96 0.055], ...
+    'String','HR: -- | SDNN: -- | RMSSD: -- | pNN50: -- | Beats: 0 | Finger: --', ...
+    'FontSize',13,'FontWeight','bold', ...
+    'ForegroundColor',[0 0 0], ...
+    'BackgroundColor',[0.92 0.92 0.92]);
+
+%% ---------- MAIN LOOP ----------
+lastAnalysis = tic;
+prevPeakTime = NaN;    % seconds, time of previous detected peak
+peakAbsTimes = [];     % absolute peak times (sec) for last window
+
+disp("Streaming HRV data... Close the figure to stop.");
+
+try
+    while ishandle(fig)
+        % ---- Read one line ----
+        try
+            rawLine = readline(s);
+        catch
+            pause(0.01); continue;
+        end
+
+        line = strtrim(char(rawLine));
+        if isempty(line), continue; end
+
+        if ~isstrprop(line(1), 'digit') && line(1) ~= '-'
+            disp("Arduino: " + string(line));
+            continue;
+        end
+
+        % ---- Parse ----
+        vals = sscanf(line, "%d,%d,%d,%d,%d");
+        if numel(vals) < 5, continue; end
+
+        redAC  = vals(1);
+        irAC   = vals(2);
+        redDC  = vals(3);
+        irDC   = vals(4);
+        finger = vals(5);
+
+        % ---- Finger-off ----
+        if finger == 0 || irDC < FINGER_MIN_IR_DC || irDC > FINGER_MAX_IR_DC
+            set(metricsBox,'String', ...
+                'HR: -- | SDNN: -- | RMSSD: -- | pNN50: -- | Beats: 0 | Finger: NO', ...
+                'ForegroundColor',[0 0 0], ...
+                'BackgroundColor',[1 0.95 0.75]);
+            drawnow limitrate;
+            continue;
+        end
+
+        nSamples = nSamples + 1;
+
+        redBuf(idx)  = redAC;
+        irBuf(idx)   = irAC;
+        irDCbuf(idx) = irDC;
+        idx = idx + 1;
+        if idx > BUF_LEN
+            idx = 1;
+            bufferReady = true;
+        end
+
+        % ---- Periodic analysis ----
+        if bufferReady && toc(lastAnalysis) >= 1.0
+            lastAnalysis = tic;
+
+            [irOrd, ~, ~] = getOrdered(irBuf, redBuf, irDCbuf, idx);
+            irFilt = filtfilt(bFilt, aFilt, double(irOrd));
+
+            % ---- Peak detection on filtered IR ----
+            minDist = round(FS * 0.33);          % >= 330 ms -> <= 180 BPM
+            minH    = 0.35 * max(irFilt);        % adaptive
+            [pks, locs] = findpeaks(irFilt, ...
+                'MinPeakDistance', minDist, ...
+                'MinPeakHeight',   minH);
+
+            % ---- Update PPG plot and markers ----
+            clearpoints(hPPG);
+            addpoints(hPPG, (1:numel(irFilt))/FS, irFilt);
+            if ~isempty(locs)
+                set(hPks, 'XData', locs/FS, 'YData', pks);
+            else
+                set(hPks, 'XData', NaN, 'YData', NaN);
+            end
+
+            % ---- Convert peak locations to NN intervals ----
+            % Peak times are relative to the START of the current 6-s buffer.
+            % We track "absolute" time using nSamples/FS as the buffer end.
+            if numel(locs) >= 2
+                bufferEndTime = nSamples / FS;
+                bufferStartTime = bufferEndTime - PPG_WINDOW_SEC;
+                peakTimesAbs = bufferStartTime + locs(:)/FS;
+
+                % Keep only NEW peaks (after the previous peak we accepted)
+                if isempty(peakAbsTimes)
+                    newPeaks = peakTimesAbs;
+                else
+                    newPeaks = peakTimesAbs(peakTimesAbs > peakAbsTimes(end) + 0.05);
+                end
+
+                for k = 1:numel(newPeaks)
+                    t = newPeaks(k);
+                    if isnan(prevPeakTime)
+                        prevPeakTime = t;
+                        continue;
+                    end
+                    nn = t - prevPeakTime;   % seconds
+                    nnMs = nn * 1000;
+
+                    % ---- NN validity ----
+                    if nnMs >= NN_MIN_MS && nnMs <= NN_MAX_MS
+                        % reject physiologically impossible jumps
+                        if ~isempty(nnHistory)
+                            medNN = median(nnHistory);
+                            if abs(nnMs - medNN*1000)/ (medNN*1000) * 100 > NN_JUMP_PCT
+                                prevPeakTime = t;
+                                continue;
+                            end
+                        end
+                        nnHistory(end+1) = nn;      %#ok<AGROW>
+                        nnTime(end+1)    = t;       %#ok<AGROW>
+                        if numel(nnHistory) > MAX_NN
+                            nnHistory(1) = [];
+                            nnTime(1)    = [];
+                        end
+                    end
+                    prevPeakTime = t;
+                end
+                peakAbsTimes = peakTimesAbs;
+            end
+
+            % ---- Rolling 60-s window of NN intervals ----
+            nowT = nSamples / FS;
+            keep = nnTime >= (nowT - HRV_WINDOW_SEC);
+            nnWin = nnHistory(keep);
+
+            % ---- HRV metrics ----
+            [sdnn, rmssd, pnn50, hrMean] = computeHRV(nnWin);
+
+            % ---- Update tachogram ----
+            clearpoints(hNN);
+            if numel(nnWin) >= 2
+                addpoints(hNN, nnTime(keep), nnWin * 1000);
+            end
+
+            % ---- Update HRV trend (only when we have enough beats) ----
+            if ~isnan(sdnn) && ~isnan(rmssd)
+                addpoints(hSDNN,  nowT, sdnn);
+                addpoints(hRMSSD, nowT, rmssd);
+            end
+
+            % ---- Metrics text ----
+            hrStr   = fmtNum(hrMean, "%.1f", "--");
+            sdnnStr = fmtNum(sdnn,   "%.1f", "--");
+            rmsStr  = fmtNum(rmssd,  "%.1f", "--");
+            pnnStr  = fmtNum(pnn50,  "%.1f", "--");
+
+            nBeats = numel(nnWin);
+            if nBeats < 10
+                bgColor = [1.00 0.95 0.75];   % yellow: insufficient data
+                tag = 'warming up';
+            elseif nBeats < 30
+                bgColor = [0.90 0.95 1.00];   % light blue: rough
+                tag = 'preliminary';
+            else
+                bgColor = [0.80 0.95 0.80];   % green: usable
+                tag = 'ok';
+            end
+
+            set(metricsBox,'String', ...
+                sprintf("HR: %s BPM | SDNN: %s ms | RMSSD: %s ms | pNN50: %s %% | Beats: %d [%s]", ...
+                hrStr, sdnnStr, rmsStr, pnnStr, nBeats, tag), ...
+                'ForegroundColor',[0 0 0], ...
+                'BackgroundColor', bgColor);
+
+            drawnow limitrate;
+        end
+    end
+catch ME
+    disp("Loop ended: " + ME.message);
+end
+
+%% ---------- SAVE ----------
+if ~isempty(nnHistory)
+    if ~isfolder('data'), mkdir('data'); end
+    T = table(nnTime(:), nnHistory(:)*1000, ...
+              'VariableNames', {'Time_sec','NN_ms'});
+    fname = fullfile('data', sprintf('hrv_%s.csv', ...
+        datestr(now,'yyyymmdd_HHMMSS')));
+    writetable(T, fname);
+    disp("Saved raw NN intervals: " + fname);
+
+    % Save summary too
+    [sdnn, rmssd, pnn50, hrMean] = computeHRV(nnHistory);
+    S = table(hrMean, sdnn, rmssd, pnn50, numel(nnHistory), ...
+              'VariableNames', {'HR_BPM','SDNN_ms','RMSSD_ms','pNN50_pct','N_beats'});
+    writetable(S, fullfile('data', sprintf('hrv_summary_%s.csv', ...
+        datestr(now,'yyyymmdd_HHMMSS'))));
+end
+
+clear s;
+disp("Done.");
+
+%% ================= HELPERS =================
+
+function closeApp(src, s)
+    try, clear s; catch, end
+    delete(src);
+end
+
+function [irOrd, redOrd, irDCOrd] = getOrdered(irBuf, redBuf, irDCbuf, idx)
+    if idx == 1
+        irOrd = irBuf; redOrd = redBuf; irDCOrd = irDCbuf;
+    else
+        irOrd   = [irBuf(idx:end);   irBuf(1:idx-1)];
+        redOrd  = [redBuf(idx:end);  redBuf(1:idx-1)];
+        irDCOrd = [irDCbuf(idx:end); irDCbuf(1:idx-1)];
+    end
+end
+
+% ============================================================
+%  HRV time-domain metrics
+% ============================================================
+function [sdnn, rmssd, pnn50, hrMean] = computeHRV(nnSec)
+% nnSec : vector of NN intervals in SECONDS
+%
+% Returns:
+%   sdnn   : standard deviation of NN intervals (ms)          [NaN if <10 beats]
+%   rmssd  : root mean square of successive NN differences (ms) [NaN if <10]
+%   pnn50  : percentage of |ΔNN| > 50 ms                        [NaN if <20]
+%   hrMean : mean heart rate (BPM) from NN intervals            [NaN if <2]
+
+    sdnn = NaN; rmssd = NaN; pnn50 = NaN; hrMean = NaN;
+
+    if numel(nnSec) < 2, return; end
+
+    nnMs = nnSec(:) * 1000;
+
+    % Reject any remaining outliers (paranoid second pass)
+    medNN = median(nnMs);
+    valid = abs(nnMs - medNN) / medNN < 0.5;
+    nnMs  = nnMs(valid);
+
+    if numel(nnMs) < 2, return; end
+
+    % ---- HR ----
+    hrMean = 60000 / mean(nnMs);
+
+    % ---- SDNN (needs >= 10 beats for meaningful value) ----
+    if numel(nnMs) >= 10
+        sdnn = std(nnMs, 1);   % population std (matches Kubios default)
+    end
+
+    % ---- RMSSD (needs >= 10 beats) ----
+    if numel(nnMs) >= 10
+        dNN = diff(nnMs);
+        rmssd = sqrt(mean(dNN.^2));
+    end
+
+    % ---- pNN50 (needs >= 20 beats to be meaningful) ----
+    if numel(nnMs) >= 20
+        dNN = abs(diff(nnMs));
+        pnn50 = 100 * sum(dNN > 50) / numel(dNN);
+    end
+end
+
+function out = fmtNum(val, fmt, fallback)
+    if isnan(val)
+        out = fallback;
+    else
+        out = sprintf(fmt, val);
+    end
+end
